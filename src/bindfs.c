@@ -215,11 +215,16 @@ static struct Settings {
     uid_t uid_offset;
     gid_t gid_offset;
 
+    bool discard_writes;
+    const char **discard_write_paths;
+
 } settings;
 
 static bool bindfs_init_failed = false;
 
-
+// Tracking number of paths for which to discard writes
+static int discard_write_paths_length = 0;
+static int discard_write_paths_size = 0;
 
 /* PROTOTYPES */
 
@@ -245,6 +250,9 @@ static int apply_uid_offset(uid_t *uid);
 static int apply_gid_offset(gid_t *gid);
 static int unapply_uid_offset(uid_t *uid);
 static int unapply_gid_offset(gid_t *gid);
+
+/* Check if a path is to have writes discarded */
+static bool discard_writes(const char *path);
 
 #ifdef __linux__
 static size_t round_up_buffer_size_for_direct_io(size_t size);
@@ -521,11 +529,15 @@ static int delete_file(const char *path, int (*target_delete_func)(const char *)
     if (real_path == NULL)
         return -errno;
 
+    // TODO: discard deletes
+
     if (settings.resolve_symlinks) {
         if (lstat(real_path, &st) == -1) {
             free(real_path);
             return -errno;
         }
+
+        // TODO: discard deletes
 
         if (S_ISLNK(st.st_mode)) {
             switch(settings.resolved_symlink_deletion_policy) {
@@ -613,6 +625,19 @@ static int unapply_gid_offset(gid_t *gid) {
     }
     *gid -= settings.gid_offset;
     return 1;
+}
+
+static bool _discard_writes(const char *path) {
+    for (int i = 0; i < discard_write_paths_length; i++) {
+        if (strcmp(settings.discard_write_paths[i], path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool discard_writes(const char *path) {
+    return settings.discard_writes || _discard_writes(path);
 }
 
 #ifdef __linux__
@@ -812,6 +837,8 @@ static int bindfs_mknod(const char *path, mode_t mode, dev_t rdev)
     if (real_path == NULL)
         return -errno;
 
+    // TODO: discard mknod
+
     mode = permchain_apply(settings.create_permchain, mode);
 
     if (S_ISFIFO(mode))
@@ -839,6 +866,8 @@ static int bindfs_mkdir(const char *path, mode_t mode)
     real_path = process_path(path, true);
     if (real_path == NULL)
         return -errno;
+
+    // TODO: discard mkdir
 
     mode |= S_IFDIR; /* tell permchain_apply this is a directory */
     mode = permchain_apply(settings.create_permchain, mode);
@@ -910,6 +939,12 @@ static int bindfs_rename(const char *from, const char *to)
         return -errno;
     }
 
+    // Fake that the file was renamed
+    if (discard_writes(from)) {
+        DPRINTF("faking rename of %s to %s", from, to);
+        return 0;
+    }
+
     res = rename(real_from, real_to);
     free(real_from);
     free(real_to);
@@ -933,6 +968,8 @@ static int bindfs_link(const char *from, const char *to)
         free(real_from);
         return -errno;
     }
+
+    // TODO: discard symlink
 
     res = link(real_from, real_to);
     free(real_from);
@@ -1066,6 +1103,12 @@ static int bindfs_truncate(const char *path, off_t size)
     if (real_path == NULL)
         return -errno;
 
+    // Fake that the file was truncated
+    if (discard_writes(path)) {
+        DPRINTF("faking truncation of %s", path);
+        return 0;
+    }
+
     res = truncate(real_path, size);
     free(real_path);
     if (res == -1)
@@ -1079,6 +1122,12 @@ static int bindfs_ftruncate(const char *path, off_t size,
 {
     int res;
     (void) path;
+
+    // Fake that the file was truncated
+    if (discard_writes(path)) {
+        DPRINTF("faking truncation of file handle from %s", path);
+        return 0;
+    }
 
     res = ftruncate(fi->fh, size);
     if (res == -1)
@@ -1126,6 +1175,12 @@ static int bindfs_create(const char *path, mode_t mode, struct fuse_file_info *f
     if (real_path == NULL)
         return -errno;
 
+    // Fake that the file was created
+    if (discard_writes(path)) {
+        DPRINTF("faking creation of %s", path);
+        return 0;
+    }
+
     mode |= S_IFREG; /* tell permchain_apply this is a regular file */
     mode = permchain_apply(settings.create_permchain, mode);
 
@@ -1160,6 +1215,24 @@ static int bindfs_open(const char *path, struct fuse_file_info *fi)
         return -errno;
 
     int flags = fi->flags;
+
+    // Adjust flags to prevent opening with write perm and truncating
+    if (discard_writes(path)) {
+        if (flags & O_WRONLY) {
+            DPRINTF("removing w flag during open of %s", path);
+            flags &= ~O_WRONLY;
+        }
+        if (flags & O_RDWR) {
+            DPRINTF("replacing rw flag with r during open of %s", path);
+            flags &= ~O_RDWR;
+            flags |= O_RDONLY;
+        }
+        if (flags & O_TRUNC) {
+            DPRINTF("removing trunc flag during open of %s", path);
+            flags &= ~O_TRUNC;
+        }
+    }
+
 #ifdef __linux__
     if (!settings.forward_odirect) {
         flags &= ~O_DIRECT;
@@ -1218,6 +1291,12 @@ static int bindfs_write(const char *path, const char *buf, size_t size,
     int res;
     (void) path;
     char *source_buf = (char*)buf;
+
+    // Fake that the requested bytes were written
+    if (discard_writes(path)) {
+        DPRINTF("faking write of %ld bytes to %s", size, path);
+        return size;
+    }
 
     if (settings.write_limiter) {
         rate_limiter_wait(settings.write_limiter, size);
@@ -1310,7 +1389,12 @@ static int bindfs_fsync(const char *path, int isdatasync,
                         struct fuse_file_info *fi)
 {
     int res;
-    (void) path;
+
+    // Fake that the buffer is being written to disk
+    if (discard_writes(path)) {
+        DPRINTF("faking flush of file handle from %s", path);
+        return 0;
+    }
 
 #ifndef HAVE_FDATASYNC
     (void) isdatasync;
@@ -1619,6 +1703,11 @@ static void print_usage(const char *progname)
            "  --multithreaded           Enable multithreaded mode. See man page\n"
            "                            for security issue with current implementation.\n"
            "  --forward-odirect=...      Forward O_DIRECT (it's cleared by default).\n"
+           "  --discard-write=...       Silently discard writes for one or more files.\n"
+           "                            Paths are relative to the mount point.\n"
+           "  --discard-writes          Silently discard writes for all files. Acts like a\n"
+           "                            read-only FS that doesn't fail on fopen() with\n"
+           "                            write flags.\n"
            "\n"
            "FUSE options:\n"
            "  -o opt[,opt,...]          Mount options.\n"
@@ -1662,7 +1751,9 @@ enum OptionKey {
     OPTKEY_ENABLE_IOCTL,
     OPTKEY_HIDE_HARD_LINKS,
     OPTKEY_RESOLVE_SYMLINKS,
-    OPTKEY_BLOCK_DEVICES_AS_FILES
+    OPTKEY_BLOCK_DEVICES_AS_FILES,
+    OPTKEY_DISCARD_WRITES,
+    OPTKEY_DISCARD_WRITE
 };
 
 static int process_option(void *data, const char *arg, int key,
@@ -1769,6 +1860,20 @@ static int process_option(void *data, const char *arg, int key,
         return 0;
     case OPTKEY_BLOCK_DEVICES_AS_FILES:
         settings.block_devices_as_files = 1;
+        return 0;
+    case OPTKEY_DISCARD_WRITES:
+        settings.discard_writes = true;
+        return 0;
+    case OPTKEY_DISCARD_WRITE:
+        // Increase space for discarded paths
+        if (discard_write_paths_length >= discard_write_paths_size) {
+            discard_write_paths_size += 20;
+            settings.discard_write_paths = realloc(settings.discard_write_paths, sizeof(const char **) * discard_write_paths_size);
+        }
+
+        // Parse out new discarded path
+        char *path = strchr(arg, '=') + 1;
+        settings.discard_write_paths[discard_write_paths_length++] = path;
         return 0;
 
     case OPTKEY_NONOPTION:
@@ -2230,6 +2335,8 @@ int main(int argc, char *argv[])
         OPT_OFFSET2("--forward-odirect=%s", "forward-odirect=%s", forward_odirect, -1),
         OPT_OFFSET2("--uid-offset=%s", "uid-offset=%s", uid_offset, 0),
         OPT_OFFSET2("--gid-offset=%s", "gid-offset=%s", gid_offset, 0),
+        OPT2("--discard-writes", "discard-writes", OPTKEY_DISCARD_WRITES),
+        OPT2("--discard-write=%s", "discard-write=%s", OPTKEY_DISCARD_WRITE),
 
         FUSE_OPT_END
     };
@@ -2278,6 +2385,7 @@ int main(int argc, char *argv[])
     settings.enable_ioctl = 0;
     settings.uid_offset = 0;
     settings.gid_offset = 0;
+    settings.discard_writes = false;
 #ifdef __linux__
     settings.forward_odirect = 0;
     settings.odirect_alignment = 0;
